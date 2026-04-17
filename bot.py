@@ -328,7 +328,8 @@ def admin_back(message):
 
 
 # ── ДОДАТИ ТРЕНЕРА ─────────────────────────────────────
-@bot.message_handler(func=lambda m: m.text == "➕ Додати тренера")
+# Теперь обработчик ищет подстроку "Додати тренера" — устойчивее к вариациям эмодзи
+@bot.message_handler(func=lambda m: m.text and "Додати тренера" in m.text)
 def add_trainer_start(message):
     if message.from_user.id != ADMIN_ID:
         return
@@ -364,9 +365,10 @@ def add_trainer_username(message):
 def add_trainer_name(message):
     trainer_form[message.chat.id]["name"] = message.text.strip()
     user_states[message.chat.id] = "add_trainer_description"
+    # Исправлена битая строка — теперь корректный текст шага 3
     bot.send_message(
         message.chat.id,
-        "��� *Додавання тренера* — крок 3/3\n\n"
+        "📝 *Додавання тренера* — крок 3/3\n\n"
         "Введіть опис тренера _(досвід, звання, спеціалізація)_:",
         parse_mode="Markdown",
         reply_markup=cancel_only_markup()
@@ -533,7 +535,8 @@ def list_trainers(message):
 # ==========================================================
 # 👤  ВИБІР ТРЕНЕРА (пользователь)
 # ==========================================================
-@bot.message_handler(func=lambda m: m.text == "♟️ Вибрати т��енера")
+# Исправлен обработчик: ищем подстроку "Вибрати тренера" (устойчивее к вариациям эмодзи/кодировок)
+@bot.message_handler(func=lambda m: m.text and "Вибрати тренера" in m.text)
 def choose_trainer_start(message):
     user_states[message.chat.id] = "user_waiting_phone"
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -858,7 +861,7 @@ def contact_admin_start(message):
     bot.send_message(
         message.chat.id,
         "⏳ Запит надіслано адміністратору\\. Очікуйте…\n"
-        "Натисніть *❌ Скасувати*, щоб повернутис�� до меню\\.",
+        "Натисніть *❌ Скасувати*, щоб повернутись до меню\\.",
         parse_mode="MarkdownV2",
         reply_markup=markup
     )
