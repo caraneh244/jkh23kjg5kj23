@@ -1,605 +1,1024 @@
+import telebot
+from telebot import types
 import os
-import time
-import json
 import logging
-import threading
-import hmac
-import hashlib
-from pathlib import Path
-from datetime import datetime
-import random
-from functools import wraps
-
+from flask import Flask, request
+import time
 import requests
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
+import json
 
-load_dotenv()
-
-# ======= Конфігурація =======
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не установлен в переменных окружения")
-
-SERVER_URL = os.getenv('SERVER_URL', 'https://goto10k-l0dh.onrender.com').rstrip('/')
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-PORT = int(os.getenv("PORT", "5000"))
-
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+# =========================
+# 📝 ЛОГУВАННЯ
+# =========================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ======= Rate limiting =======
-request_counts = {}
-RATE_LIMIT_WINDOW = 60
-RATE_LIMIT_MAX = 10
+# =========================
+# 🔐 НАЛАШТУВАННЯ (з Render env)
+# =========================
+TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "ТВІЙ_ТОКЕН_БОТА")
+ADMIN_ID    = int(os.getenv("ADMIN_ID", "887078537"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://78655.onrender.com")
+TURSO_URL   = os.getenv("TURSO_URL",   "https://1qaz2wsx-yhbvgt65.aws-eu-west-1.turso.io")
+TURSO_TOKEN = os.getenv("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjE4MDc4NjA1NDEsImlhdCI6MTc3NjMyNDU0MSwiaWQiOiIwMTlkOTUyZC03YjAxLTc3N2QtYjE4NS03MDEzY2JjOWYwMDkiLCJyaWQiOiI3NmJlZDlhMy01Zjk1LTQ0OGYtYThkYi1kZTY2OTNmNjcwZTAifQ.fN9MZ5inviHOnUNqhrW20hbt1oUmHS6E2auA_grZ6pcv02NvEKEmrI5Ms_oSnwbBM1nTsR-TmE7SSIrB4utKDw")
 
-def rate_limit_check(user_id):
-    """Перевірка rate limiting"""
-    current_time = time.time()
-    key = f"user_{user_id}_{int(current_time // RATE_LIMIT_WINDOW)}"
-    
-    request_counts[key] = request_counts.get(key, 0) + 1
-    
-    if request_counts[key] > RATE_LIMIT_MAX:
-        return False
-    
-    # Очистка старих записів
-    if len(request_counts) > 1000:
-        request_counts.clear()
-    
-    return True
+MAX_DB_RETRIES = 3
+DB_RETRY_DELAY = 2
 
-# ======= Idle mode =======
-idle_mode_enabled = True
-idle_min_interval = 60
-idle_max_interval = 600
-idle_thread = None
-idle_stop_event = threading.Event()
+# =========================
+# 📊 СТАНИ СЕСІЙ (в пам'яті)
+# =========================
+user_states  = {}   # {chat_id: "state_name"}
+user_form    = {}   # {chat_id: {phone, name, level, trainer_id, trainer_name, trainer_username}}
+trainer_form = {}   # {chat_id: {username, name, description}}
+admin_chats  = {}   # {user_chat_id: admin_chat_id}
 
-# ======= Персистентній лічильник та послідовність (МОДЕРНІЗОВАНО) =======
-PERSIST_FILE = Path("message_count.json")
-SEQUENCE_FILE = Path("message_sequence.json")
-HISTORY_FILE = Path("message_history.json")
-lock = threading.Lock()
+bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 
-def load_count():
-    """Завантаження загального лічильника"""
-    try:
-        if PERSIST_FILE.exists():
-            data = json.loads(PERSIST_FILE.read_text(encoding="utf-8"))
-            return int(data.get("count", 0))
-    except Exception as e:
-        logger.exception(f"Failed to load count: {e}")
-    return 0
+# ==========================================================
+# 🗄️  TURSO DATABASE LAYER
+# ==========================================================
 
-def save_count(value):
-    """Збереження загального лічильника"""
-    try:
-        PERSIST_FILE.write_text(json.dumps({"count": int(value)}), encoding="utf-8")
-    except Exception as e:
-        logger.exception(f"Failed to save count: {e}")
-
-def load_sequence():
-    """Завантаження глобального лічильника послідовності"""
-    try:
-        if SEQUENCE_FILE.exists():
-            data = json.loads(SEQUENCE_FILE.read_text(encoding="utf-8"))
-            return int(data.get("sequence", 0))
-    except Exception as e:
-        logger.exception(f"Failed to load sequence: {e}")
-    return 0
-
-def save_sequence(value):
-    """Збереження глобального лічильника послідовності"""
-    try:
-        SEQUENCE_FILE.write_text(json.dumps({"sequence": int(value)}), encoding="utf-8")
-    except Exception as e:
-        logger.exception(f"Failed to save sequence: {e}")
-
-def load_history():
-    """Завантаження історії повідомлень"""
-    try:
-        if HISTORY_FILE.exists():
-            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-            return data.get("history", [])
-    except Exception as e:
-        logger.exception(f"Failed to load history: {e}")
-    return []
-
-def save_history(history):
-    """Збереження історії повідомлень"""
-    try:
-        HISTORY_FILE.write_text(json.dumps({"history": history}, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        logger.exception(f"Failed to save history: {e}")
-
-# ======= Ініціалізація глобальних змінних =======
-message_count = load_count()
-global_sequence = load_sequence()
-message_history = load_history()
-sending_in_progress = False
-sending_lock = threading.Lock()
-
-def increment_count():
-    """Збільшення лічильника повідомлень"""
-    global message_count
-    with lock:
-        message_count += 1
-        save_count(message_count)
-        return message_count
+def _unpack_turso_value(v):
+    if not isinstance(v, dict):
+        return v
+    t, val = v.get("type", ""), v.get("value")
+    if val is None or t == "null":
+        return None
+    if t == "integer":
+        try: return int(val)
+        except: return val
+    if t == "float":
+        try: return float(val)
+        except: return val
+    return val
 
 
-def get_next_sequence():
-    """Отримання наступного номеру послідовності (КРИТИЧНО ДЛЯ ФІКСУ)"""
-    global global_sequence
-    with lock:
-        global_sequence += 1
-        save_sequence(global_sequence)
-        return global_sequence
-
-
-def add_to_history(batch_id, total_count, sent_count, status, timestamp=None):
-    """Додавання запису до історії"""
-    global message_history
-    if timestamp is None:
-        timestamp = datetime.now().isoformat()
-    
-    record = {
-        "batch_id": batch_id,
-        "total_requested": total_count,
-        "total_sent": sent_count,
-        "status": status,
-        "timestamp": timestamp
-    }
-    
-    with lock:
-        message_history.append(record)
-        # Зберігаємо тільки останні 1000 записів
-        if len(message_history) > 1000:
-            message_history = message_history[-1000:]
-        save_history(message_history)
-    
-    logger.info(f"[HISTORY] Batch {batch_id}: {sent_count}/{total_count} ({status})")
-    return record
-
-def get_history_stats():
-    """Отримання статистики з історії"""
-    with lock:
-        successful_batches = len([h for h in message_history if h["status"] == "completed"])
-        total_from_history = sum([h["total_sent"] for h in message_history])
-        return {
-            "successful_batches": successful_batches,
-            "total_from_history": total_from_history,
-            "total_batches": len(message_history)
-        }
-
-# ======= Текстові константи =======
-WELCOME_TEXT = (
-    "<b>👋 Привіт!</b>\n\n"
-    "Я допоможу вам надіслати повідомлення в канал.\n\n"
-    "<b>📊 Всього надіслано:</b> {count}\n"
-    "<b>🔢 Глобальна послідовність:</b> {sequence}\n"
-    "<b>📦 Успішних партій:</b> {batches}"
-)
-
-STATS_TEXT = (
-    "<b>📊 Статистика</b>\n\n"
-    "<b>Всього повідомлень:</b> {count}\n"
-    "<b>Глобальна послідовність:</b> {sequence}\n"
-    "<b>Успішних партій:</b> {batches}\n"
-    "<b>З історії:</b> {history_total}"
-)
-
-SENDING_TEXT = (
-    "<b>⏳ Відправляю {count} повідомлень...</b>\n"
-    "<b>Batch ID:</b> {batch_id}"
-)
-
-DONE_TEXT = (
-    "<b>✅ Готово</b>\n\n"
-    "<b>Batch ID:</b> {batch_id}\n"
-    "<b>Запрошено:</b> {requested}\n"
-    "<b>Надіслано:</b> {sent}\n"
-    "<b>Всього (глобально):</b> {total}\n"
-    "<b>Послідовність:</b> {sequence}"
-)
-
-SENDING_IN_PROGRESS_TEXT = (
-    "⚠️ <b>Відправлення вже в процесі!</b>\n\n"
-    "Зачекайте, поки завершиться попереднє відправлення."
-)
-
-ERROR_FORMAT_TEXT = "❌ Неверний формат. Використовуйте +<число>, наприклад +20"
-ERROR_ADMIN_TEXT = "❌ Ви не адміністратор"
-ERROR_RATE_LIMIT = "❌ Забагато запитів. Спробуйте пізніше"
-ERROR_SEND_FAILED = "❌ Помилка при відправленні: {error}"
-
-# ======= Idle mode функції =======
-def simulate_user_activity():
-    try:
-        activity_log = [
-            "Користувач відправив повідомлення",
-            "Користувач переглядає статистику",
-            "Користувач відправляє команду",
-        ]
-        activity = random.choice(activity_log)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"[IDLE MODE] {timestamp} → {activity}")
-    except Exception as e:
-        logger.error(f"Error in simulate_user_activity: {e}")
-
-
-def idle_mode_worker():
-    logger.info("[IDLE MODE] Холостий хід активований")
-    while not idle_stop_event.is_set():
-        try:
-            wait_time = random.randint(idle_min_interval, idle_max_interval)
-            if idle_stop_event.wait(timeout=wait_time):
-                break
-            simulate_user_activity()
-        except Exception as e:
-            logger.error(f"[IDLE MODE] Помилка: {e}")
-            time.sleep(5)
-
-
-def start_idle_mode():
-    global idle_thread
-    try:
-        if idle_mode_enabled and idle_thread is None:
-            idle_stop_event.clear()
-            idle_thread = threading.Thread(target=idle_mode_worker, daemon=True)
-            idle_thread.start()
-            logger.info("[IDLE MODE] Потік запущен")
-    except Exception as e:
-        logger.error(f"Error starting idle mode: {e}")
-
-
-def stop_idle_mode():
-    global idle_thread
-    try:
-        if idle_thread is not None:
-            idle_stop_event.set()
-            idle_thread.join(timeout=2)
-            idle_thread = None
-            logger.info("[IDLE MODE] Потік зупинен")
-    except Exception as e:
-        logger.error(f"Error stopping idle mode: {e}")
-
-# ======= Telegram API функції =======
-API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-def send_message_safe(chat_id, text, parse_mode=None, reply_markup=None, max_retries=3):
-    """МОДИФІКОВАНО: Безпечна відправка з повторними спробами"""
-    url = f"{API_BASE}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup is not None:
-        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-    
-    for attempt in range(max_retries):
-        try:
-            resp = requests.post(url, json=payload, timeout=10)
-            resp.raise_for_status()
-            result = resp.json()
-            
-            if result.get("ok"):
-                logger.info(f"[SEND] Успішно відправлено до {chat_id} (спроба {attempt + 1})")
-                return result
-            else:
-                error_msg = result.get("description", "Unknown error")
-                logger.warning(f"[SEND] Telegram API помилка: {error_msg}")
-                if attempt < max_retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                continue
-        except requests.exceptions.Timeout:
-            logger.warning(f"[SEND] Timeout при спробі {attempt + 1}/{max_retries}")
-            if attempt < max_retries - 1:
-                time.sleep(1 * (attempt + 1))
-            continue
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(f"[SEND] Помилка з'єднання при спробі {attempt + 1}/{max_retries}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1 * (attempt + 1))
-            continue
-        except Exception as e:
-            logger.error(f"[SEND] Непередбачена помилка при спробі {attempt + 1}/{max_retries}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))
-            continue
-    
-    logger.error(f"[SEND] Не вдалось відправити повідомлення до {chat_id} після {max_retries} спроб")
-    return None
-
-
-def send_message(chat_id, text, parse_mode=None, reply_markup=None):
-    """Обгортка для зворотної сумісності"""
-    return send_message_safe(chat_id, text, parse_mode, reply_markup)
-
-
-def register_webhook():
-    url = f"{API_BASE}/setWebhook"
-    webhook_endpoint = f"{SERVER_URL}/webhook"
-    payload = {
-        "url": webhook_endpoint,
-        "allowed_updates": ["message"]
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("ok"):
-            logger.info(f"✅ Вебхук зареєстрований: {webhook_endpoint}")
-            return True
+class QueryResult:
+    def __init__(self, rows=None):
+        self.rows = []
+        if not rows:
+            return
+        first = rows[0]
+        if isinstance(first, dict) and "values" in first:
+            self.rows = [tuple(_unpack_turso_value(v) for v in r.get("values", [])) for r in rows]
+        elif isinstance(first, dict):
+            self.rows = [tuple(r.values()) for r in rows]
         else:
-            logger.error(f"❌ Помилка: {result.get('description')}")
-            return False
-    except Exception as e:
-        logger.exception(f"❌ Помилка реєстрації вебхука: {e}")
-        return False
+            self.rows = [tuple(r) if not isinstance(r, tuple) else r for r in rows]
 
 
-def delete_webhook():
-    url = f"{API_BASE}/deleteWebhook"
+class TursoClient:
+    def __init__(self, url: str, auth_token: str):
+        if url.startswith("libsql://"):
+            url = url.replace("libsql://", "https://", 1)
+        self.url     = url.rstrip("/")
+        self.headers = {"Authorization": f"Bearer {auth_token}", "Content-Type": "application/json"}
+
+    def execute(self, sql: str, args: list = None) -> QueryResult:
+        stmt = {"sql": sql}
+        if args:
+            turso_args = []
+            for a in args:
+                if a is None:              turso_args.append({"type": "null",    "value": None})
+                elif isinstance(a, bool):  turso_args.append({"type": "integer", "value": str(int(a))})
+                elif isinstance(a, int):   turso_args.append({"type": "integer", "value": str(a)})
+                elif isinstance(a, float): turso_args.append({"type": "float",   "value": str(a)})
+                else:                      turso_args.append({"type": "text",    "value": str(a)})
+            stmt["args"] = turso_args
+
+        payload = {"requests": [{"type": "execute", "stmt": stmt}, {"type": "close"}]}
+        resp    = requests.post(f"{self.url}/v2/pipeline", json=payload, headers=self.headers, timeout=10)
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+        data    = resp.json()
+        results = data.get("results", [])
+        if not results:
+            return QueryResult([])
+
+        first = results[0]
+        if first.get("type") == "error":
+            err = first.get("error", {})
+            raise Exception(f"DB Error: {err.get('message', str(err)) if isinstance(err, dict) else err}")
+
+        response_obj = first.get("response", {})
+        result_inner = response_obj.get("result", {}) if isinstance(response_obj, dict) else {}
+        rows         = result_inner.get("rows") if isinstance(result_inner, dict) else None
+        if rows is None and isinstance(response_obj, dict):
+            rows = response_obj.get("rows")
+
+        logger.info(f"✅ SQL OK — {len(rows) if rows else 0} rows")
+        return QueryResult(rows or [])
+
+
+_client: TursoClient = None
+
+
+def _init_client() -> bool:
+    global _client
     try:
-        resp = requests.post(url, timeout=10)
-        resp.raise_for_status()
-        logger.info("✅ Вебхук видалений")
+        _client = TursoClient(url=TURSO_URL, auth_token=TURSO_TOKEN)
+        _client.execute("SELECT 1")
+        logger.info("✅ Підключено до Turso")
         return True
     except Exception as e:
-        logger.exception(f"❌ Помилка видалення вебхука: {e}")
+        logger.error(f"❌ _init_client: {e}")
+        _client = None
         return False
 
-# ======= Обработка команд в отдельном потоке =======
-def handle_command(command, chat_id, user_id):
+
+def get_db(retry: int = 0) -> TursoClient:
+    global _client
+    if _client is None:
+        if retry >= MAX_DB_RETRIES:
+            return None
+        time.sleep(DB_RETRY_DELAY)
+        _init_client()
+        return get_db(retry + 1)
     try:
-        logger.info(f"[THREAD] Команда: {command} від {chat_id}")
+        _client.execute("SELECT 1")
+        return _client
+    except Exception:
+        _client = None
+        return get_db(retry)
 
-        if command.startswith("/start"):
-            hist_stats = get_history_stats()
-            text = WELCOME_TEXT.format(
-                count=message_count,
-                sequence=global_sequence,
-                batches=hist_stats["successful_batches"]
+
+def init_db() -> bool:
+    db = get_db()
+    if not db:
+        return False
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS trainers (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                username    TEXT UNIQUE NOT NULL,
+                name        TEXT NOT NULL,
+                description TEXT,
+                created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-            send_message(chat_id, text, parse_mode="HTML")
-
-        elif command.startswith("/stats"):
-            hist_stats = get_history_stats()
-            text = STATS_TEXT.format(
-                count=message_count,
-                sequence=global_sequence,
-                batches=hist_stats["successful_batches"],
-                history_total=hist_stats["total_from_history"]
-            )
-            send_message(chat_id, text, parse_mode="HTML")
-
-        else:
-            send_message(chat_id, "Команда не розпізнана. Використовуйте /start або /stats", parse_mode="HTML")
-
+        """)
+        logger.info("✅ Таблиця trainers готова")
+        return True
     except Exception as e:
-        logger.error(f"[THREAD ERROR] {e}", exc_info=True)
+        logger.error(f"❌ init_db: {e}")
+        return False
 
 
-def handle_plus_command(chat_id, user_id, text):
-    global sending_in_progress, message_count, global_sequence    
-    try:
-        logger.info(f"[THREAD] +число команда від {user_id}")
+# ==========================================================
+# 🛠️  КОНСТАНТИ І ДОПОМІЖНІ ФУНКЦІЇ
+# ==========================================================
 
-        # Перевірка адміністратора
-        if user_id != ADMIN_ID:
-            send_message(chat_id, ERROR_ADMIN_TEXT, parse_mode="HTML")
-            return
+BTN_CANCEL = "❌ Скасувати"
+BTN_EDIT   = "⚙️ Edit"
+BTN_BACK   = "⬅️ Назад"
 
-        # Перевірка, чи вже відправляється (КРИТИЧНО ДЛЯ ФІКСУ)
-        with sending_lock:
-            if sending_in_progress:
-                send_message(chat_id, SENDING_IN_PROGRESS_TEXT, parse_mode="HTML")
-                return
-            sending_in_progress = True
+ADMIN_RESERVED = {
+    BTN_EDIT, BTN_BACK, BTN_CANCEL,
+    "➕ Додати тренера", "➖ Видалити тренера", "📋 Список тренерів",
+}
 
-        # Парсинг числа
-        try:
-            count = int(text.lstrip("+").strip())
-            if count <= 0:
-                raise ValueError("non-positive")
-            if count > 1000:
-                send_message(chat_id, "❌ Максимум 1000 повідомлень за раз", parse_mode="HTML")
-                with sending_lock:
-                    sending_in_progress = False
-                return
-        except Exception:
-            send_message(chat_id, ERROR_FORMAT_TEXT, parse_mode="HTML")
-            with sending_lock:
-                sending_in_progress = False
-            return
 
-        # Генеруємо унікальний ID для цієї партії
-        batch_id = get_next_sequence()
-        
-        # Відправка сповіщення про початок
-        text_sending = SENDING_TEXT.format(count=count, batch_id=batch_id)
-        send_message(chat_id, text_sending, parse_mode="HTML")        
-        logger.info(f"[BATCH {batch_id}] Початок відправлення {count} повідомлень")
+def main_menu_markup(user_id: int) -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    m.row("♟️ Вибрати тренера", "👨‍🏫 Наші тренери")
+    m.add("💬 Зв'язатися з адміністратором")
+    if user_id == ADMIN_ID:
+        m.add(BTN_EDIT)
+    return m
 
-        sent = 0
-        failed = 0
-        sequence_start = global_sequence
-        
-        for i in range(count):
+
+def admin_menu_markup() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    m.add("➕ Додати тренера", "➖ Видалити тренера")
+    m.add("📋 Список тренерів")
+    m.add(BTN_BACK)
+    return m
+
+
+def cancel_only_markup() -> types.ReplyKeyboardMarkup:
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    m.add(BTN_CANCEL)
+    return m
+
+
+def send_main_menu(chat_id: int, user_id: int, text: str = "Головне меню:"):
+    user_states.pop(chat_id, None)
+    user_form.pop(chat_id, None)
+    trainer_form.pop(chat_id, None)
+    user_states[chat_id] = "main_menu"
+    bot.send_message(chat_id, text, reply_markup=main_menu_markup(user_id))
+
+
+def reset_to_main(message):
+    """Универсальная отмена — всегда возвращает в главное меню.
+    Если был активен чат с админом — корректно завершает его."""
+    cid = message.chat.id
+    uid = message.from_user.id
+
+    if uid == ADMIN_ID:
+        partner_id = next((u for u, a in admin_chats.items() if a == uid), None)
+        if partner_id:
+            admin_chats.pop(partner_id, None)
+            user_states.pop(partner_id, None)
             try:
-                # МОДИФІКОВАНО: Отримуємо послідовність перед відправкою
-                seq_num = get_next_sequence()
-                local_num = i + 1
-                
-                # МОДИФІКОВАНО: Комбінований номер (локальний + глобальний)
-                msg_text = f"+{local_num} (Seq: {seq_num})"
-                
-                # МОДИФІКОВАНО: Відправляємо з перевіркою успішності
-                result = send_message_safe(CHANNEL_ID, msg_text, max_retries=3)
-                
-                if result and result.get("ok"):
-                    # МОДИФІКОВАНО: Тільки збільшуємо счетчик при успішній відправці
-                    increment_count()
-                    sent += 1
-                    logger.info(f"[BATCH {batch_id}] Повідомлення {local_num}/{count} успішно (Seq: {seq_num})")
-                else:
-                    # Якщо не вдалось, пропускаємо і рахуємо як невдачу
-                    failed += 1
-                    logger.warning(f"[BATCH {batch_id}] Не вдалось відправити повідомлення {local_num} (Seq: {seq_num})")
-                
-                # МОДИФІКОВАНО: Збільшена затримка з 0.15 до 0.3 секунди
-                time.sleep(0.3)
-                
-            except Exception as e:
-                failed += 1
-                logger.exception(f"[BATCH {batch_id}] Error sending message {i + 1}: {e}")
-                time.sleep(0.3)
+                bot.send_message(partner_id, "👋 Адміністратор завершив чат.",
+                                 reply_markup=main_menu_markup(partner_id))
+            except Exception:
+                pass
+    elif cid in admin_chats:
+        admin_id = admin_chats.pop(cid)
+        try:
+            bot.send_message(admin_id, f"👤 Користувач завершив чат.")
+        except Exception:
+            pass
 
-        # Додаємо запис до історії
-        status = "completed" if sent == count else "partial" if sent > 0 else "failed"
-        add_to_history(batch_id, count, sent, status)
-        
-        text_done = DONE_TEXT.format(
-            batch_id=batch_id,
-            requested=count,
-            sent=sent,
-            total=message_count,
-            sequence=global_sequence
+    send_main_menu(cid, uid, "↩️ Повернення до головного меню.")
+
+
+def format_trainer_card(name: str, username: str, desc: str, index: int = None) -> str:
+    """Красиво форматирует карточку тренера."""
+    prefix = f"{index}\\. " if index else ""
+    desc_text = desc if desc else "Опис не вказано"
+    return (
+        f"{prefix}👨‍🏫 *{name}*\n"
+        f"📎 @{username}\n"
+        f"📝 _{desc_text}_\n"
+        f"{'─' * 28}"
+    )
+
+
+# ==========================================================
+# 🏁  /start
+# ==========================================================
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    send_main_menu(message.chat.id, message.from_user.id,
+                   "♟️ Ласкаво просимо до Шахової школи!\nОберіть дію:")
+
+
+# ==========================================================
+# ❌  УНИВЕРСАЛЬНАЯ ОТМЕНА  (регистрируется первой!)
+# ==========================================================
+
+@bot.message_handler(func=lambda m: m.text == BTN_CANCEL)
+def universal_cancel(message):
+    reset_to_main(message)
+
+
+# ==========================================================
+# 👨‍🏫  НАШІ ТРЕНЕРИ (публичная кнопка в главном меню)
+# ==========================================================
+
+@bot.message_handler(func=lambda m: m.text == "👨‍🏫 Наші тренери")
+def show_our_trainers(message):
+    db = get_db()
+    if not db:
+        bot.send_message(message.chat.id, "❌ Помилка підключення до БД.")
+        return
+    try:
+        trainers = db.execute(
+            "SELECT id, name, username, description FROM trainers ORDER BY name"
+        ).rows
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+        return
+
+    if not trainers:
+        bot.send_message(
+            message.chat.id,
+            "😔 Тренерів поки немає. Перевірте пізніше!",
+            reply_markup=main_menu_markup(message.from_user.id)
         )
-        
-        # Додаємо інформацію про невдачі
-        if failed > 0:
-            text_done += f"\n<b>⚠️ Помилок:</b> {failed}"
-        
-        send_message(chat_id, text_done, parse_mode="HTML")        
-        logger.info(f"[BATCH {batch_id}] Завершено: {sent}/{count} успішно, {failed} помилок, послідовність: {sequence_start}-{global_sequence}")
+        return
+
+    header = f"👨‍🏫 *Наші тренери* — {len(trainers)} фахівці:\n\n"
+    bot.send_message(message.chat.id, header, parse_mode="Markdown")
+
+    for i, row in enumerate(trainers, 1):
+        name  = str(row[1])
+        uname = str(row[2])
+        desc  = str(row[3]) if row[3] else ""
+        card  = format_trainer_card(name, uname, desc, index=i)
+        bot.send_message(message.chat.id, card, parse_mode="Markdown")
+
+    bot.send_message(
+        message.chat.id,
+        "Хочете записатись? Натисніть *♟️ Вибрати тренера*",
+        parse_mode="Markdown",
+        reply_markup=main_menu_markup(message.from_user.id)
+    )
+
+
+# ==========================================================
+# 👨‍💼  АДМІН-ПАНЕЛЬ
+# ==========================================================
+
+@bot.message_handler(func=lambda m: m.text == BTN_EDIT)
+def admin_panel(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.send_message(message.chat.id, "❌ Немає доступу.")
+        return
+    user_states[message.chat.id] = "admin_panel"
+    bot.send_message(message.chat.id, "👨‍💼 Адмін-панель:", reply_markup=admin_menu_markup())
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_BACK)
+def admin_back(message):
+    send_main_menu(message.chat.id, message.from_user.id, "🔙 Повернення до меню.")
+
+
+# ── ДОДАТИ ТРЕНЕРА ─────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "➕ Додати тренера")
+def add_trainer_start(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    trainer_form[message.chat.id] = {}
+    user_states[message.chat.id]  = "add_trainer_username"
+    bot.send_message(
+        message.chat.id,
+        "📝 *Додавання тренера* — крок 1/3\n\n"
+        "Введіть @username тренера у Telegram:\n"
+        "_(приклад: @chess\\_coach\\_ivan)_",
+        parse_mode="Markdown",
+        reply_markup=cancel_only_markup()
+    )
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "add_trainer_username")
+def add_trainer_username(message):
+    username = message.text.strip()
+    if not username.startswith("@"):
+        bot.send_message(message.chat.id, "❌ Username має починатися з @. Спробуйте ще раз:")
+        return
+    trainer_form[message.chat.id].update({"username": username[1:], "display_username": username})
+    user_states[message.chat.id] = "add_trainer_name"
+    bot.send_message(
+        message.chat.id,
+        "📝 *Додавання тренера* — крок 2/3\n\nВведіть повне ім'я тренера:",
+        parse_mode="Markdown",
+        reply_markup=cancel_only_markup()
+    )
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "add_trainer_name")
+def add_trainer_name(message):
+    trainer_form[message.chat.id]["name"] = message.text.strip()
+    user_states[message.chat.id] = "add_trainer_description"
+    bot.send_message(
+        message.chat.id,
+        "📝 *Додавання тренера* — крок 3/3\n\n"
+        "Введіть опис тренера _(досвід, звання, спеціалізація)_:",
+        parse_mode="Markdown",
+        reply_markup=cancel_only_markup()
+    )
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "add_trainer_description")
+def add_trainer_description(message):
+    data = trainer_form.get(message.chat.id, {})
+    data["description"] = message.text.strip()
+    db = get_db()
+    if not db:
+        bot.send_message(message.chat.id, "❌ Помилка підключення до БД.", reply_markup=admin_menu_markup())
+        user_states.pop(message.chat.id, None)
+        trainer_form.pop(message.chat.id, None)
+        return
+    try:
+        db.execute(
+            "INSERT INTO trainers (username, name, description) VALUES (?, ?, ?)",
+            [data["username"], data["name"], data["description"]]
+        )
+        bot.send_message(
+            message.chat.id,
+            f"✅ Тренер *{data['name']}* ({data['display_username']}) успішно доданий!",
+            parse_mode="Markdown",
+            reply_markup=admin_menu_markup()
+        )
+        logger.info(f"✅ Додано тренера: {data['name']}")
+    except Exception as e:
+        if "unique" in str(e).lower() or "constraint" in str(e).lower():
+            bot.send_message(message.chat.id,
+                             f"⚠️ Тренер {data['display_username']} вже існує в базі.",
+                             reply_markup=admin_menu_markup())
+        else:
+            bot.send_message(message.chat.id, f"❌ Помилка: {e}", reply_markup=admin_menu_markup())
+    user_states.pop(message.chat.id, None)
+    trainer_form.pop(message.chat.id, None)
+
+
+# ── ВИДАЛИТИ ТРЕНЕРА ────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == "➖ Видалити тренера")
+def delete_trainer_start(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    db = get_db()
+    if not db:
+        bot.send_message(message.chat.id, "❌ Помилка підключення до БД.")
+        return
+    try:
+        trainers = db.execute("SELECT id, name, username FROM trainers ORDER BY name").rows
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+        return
+    if not trainers:
+        bot.send_message(message.chat.id, "📭 Тренерів немає.", reply_markup=admin_menu_markup())
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    for row in trainers:
+        tid   = int(row[0])
+        name  = str(row[1])
+        uname = str(row[2])
+        markup.add(types.InlineKeyboardButton(
+            f"🗑 {name}  (@{uname})",
+            callback_data=f"deltrnr_{tid}"   # короткий ключ, без лишних "_"
+        ))
+    bot.send_message(
+        message.chat.id,
+        f"🗑 Оберіть тренера для видалення ({len(trainers)} чол.):\n"
+        "⚠️ Видалення відбудеться одразу.",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("deltrnr_"))
+def delete_trainer_confirm(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Немає доступу", show_alert=True)
+        return
+
+    try:
+        tid = int(call.data.split("_")[1])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "❌ Некоректні дані", show_alert=True)
+        return
+
+    db = get_db()
+    if not db:
+        bot.answer_callback_query(call.id, "❌ Помилка БД", show_alert=True)
+        return
+    try:
+        result = db.execute("SELECT name FROM trainers WHERE id = ?", [tid])
+        if not result.rows:
+            bot.answer_callback_query(call.id, "❌ Тренера не знайдено", show_alert=True)
+            return
+        name = str(result.rows[0][0])
+        db.execute("DELETE FROM trainers WHERE id = ?", [tid])
+        logger.info(f"🗑 Видалено тренера: {name} (id={tid})")
+
+        bot.answer_callback_query(call.id, f"✅ {name} видалений!")
+        bot.edit_message_text(
+            f"✅ Тренер *{name}* успішно видалений з бази.",
+            call.message.chat.id, call.message.message_id,
+            parse_mode="Markdown"
+        )
+        bot.send_message(call.message.chat.id, "Що далі?", reply_markup=admin_menu_markup())
 
     except Exception as e:
-        logger.error(f"[THREAD ERROR] {e}", exc_info=True)
-    finally:
-        with sending_lock:
-            sending_in_progress = False
+        bot.answer_callback_query(call.id, f"❌ {str(e)[:80]}", show_alert=True)
 
-# ======= Webhook handler =======
+
+# ── СПИСОК ТРЕНЕРІВ (адмін) — красивые карточки ─────────
+
+@bot.message_handler(func=lambda m: m.text == "📋 Список тренерів")
+def list_trainers(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    db = get_db()
+    if not db:
+        bot.send_message(message.chat.id, "❌ Помилка підключення до БД.")
+        return
+    try:
+        trainers = db.execute(
+            "SELECT id, name, username, description FROM trainers ORDER BY name"
+        ).rows
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+        return
+    if not trainers:
+        bot.send_message(message.chat.id, "📭 Список тренерів порожній.")
+        return
+
+    bot.send_message(
+        message.chat.id,
+        f"📋 *Тренери в базі* — {len(trainers)} чол.:",
+        parse_mode="Markdown"
+    )
+    for i, row in enumerate(trainers, 1):
+        tid   = int(row[0])
+        name  = str(row[1])
+        uname = str(row[2])
+        desc  = str(row[3]) if row[3] else ""
+
+        card = (
+            f"*{i}\\. {name}*\n"
+            f"🔗 @{uname}  \\(ID: `{tid}`\\)\n"
+            f"📝 _{desc if desc else 'Опис не вказано'}_"
+        )
+        bot.send_message(message.chat.id, card, parse_mode="MarkdownV2")
+
+
+# ==========================================================
+# 👤  ВИБІР ТРЕНЕРА (пользователь)
+# ==========================================================
+
+@bot.message_handler(func=lambda m: m.text == "♟️ Вибрати тренера")
+def choose_trainer_start(message):
+    user_states[message.chat.id] = "user_waiting_phone"
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("📱 Поділитися номером", request_contact=True))
+    markup.add(BTN_CANCEL)
+    bot.send_message(
+        message.chat.id,
+        "📱 *Крок 1 з 3* — Поділіться вашим номером телефону\n\n"
+        "Натисніть кнопку нижче — це потрібно для зв'язку з тренером:",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+
+@bot.message_handler(content_types=["contact"])
+def user_got_phone(message):
+    if user_states.get(message.chat.id) != "user_waiting_phone":
+        return
+    user_form[message.chat.id] = {"phone": message.contact.phone_number}
+    user_states[message.chat.id] = "user_waiting_name"
+    bot.send_message(
+        message.chat.id,
+        "✍️ *Крок 2 з 3* — Введіть ваше ім'я та прізвище:",
+        parse_mode="Markdown",
+        reply_markup=cancel_only_markup()
+    )
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "user_waiting_name")
+def user_got_name(message):
+    user_form[message.chat.id]["name"] = message.text.strip()
+    user_states[message.chat.id] = "user_waiting_level"
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("🌱 Початківець", "🎯 Аматор")
+    markup.row("⚔️ Просунутий",  "👑 Експерт")
+    markup.add(BTN_CANCEL)
+    bot.send_message(
+        message.chat.id,
+        "♟️ *Крок 3 з 3* — Оберіть ваш рівень гри:",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.chat.id) == "user_waiting_level")
+def user_got_level(message):
+    allowed = {"🌱 Початківець", "🎯 Аматор", "⚔️ Просунутий", "👑 Експерт"}
+    if message.text not in allowed:
+        bot.send_message(message.chat.id, "Оберіть рівень із кнопок нижче.")
+        return
+    user_form[message.chat.id]["level"] = message.text
+
+    db = get_db()
+    if not db:
+        bot.send_message(message.chat.id, "❌ Помилка підключення до БД.")
+        reset_to_main(message)
+        return
+    try:
+        trainers = db.execute(
+            "SELECT id, name, description FROM trainers ORDER BY name"
+        ).rows
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+        reset_to_main(message)
+        return
+
+    if not trainers:
+        bot.send_message(
+            message.chat.id,
+            "😔 Тренерів поки немає. Спробуйте пізніше.",
+            reply_markup=main_menu_markup(message.from_user.id)
+        )
+        user_states.pop(message.chat.id, None)
+        user_form.pop(message.chat.id, None)
+        return
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Рівень *{message.text}* збережено\\!\n\n"
+        f"👇 Оберіть тренера — натисніть *Обрати* під карткою:",
+        parse_mode="MarkdownV2",
+        reply_markup=cancel_only_markup()
+    )
+
+    for row in trainers:
+        tid  = int(row[0])
+        name = str(row[1])
+        desc = str(row[2]) if row[2] else "Опис відсутній"
+
+        card = (
+            f"👨‍🏫 *{name}*\n"
+            f"─────────────────────\n"
+            f"📝 {desc}"
+        )
+        pick_markup = types.InlineKeyboardMarkup()
+        pick_markup.add(types.InlineKeyboardButton(
+            f"✅ Обрати {name}",
+            callback_data=f"pick_{tid}"
+        ))
+        bot.send_message(
+            message.chat.id,
+            card,
+            parse_mode="Markdown",
+            reply_markup=pick_markup
+        )
+
+    user_states[message.chat.id] = "user_picking_trainer"
+
+
+# ==========================================================
+# ✅  ОБРАТИ ТРЕНЕРА → запрос на подтверждение админу
+# ==========================================================
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pick_"))
+def user_picked_trainer(call):
+    cid = call.message.chat.id
+
+    try:
+        tid = int(call.data.split("_")[1])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "❌ Некоректні дані", show_alert=True)
+        return
+
+    data = user_form.get(cid)
+    if not data:
+        bot.answer_callback_query(call.id, "❌ Сесія застаріла. Натисніть /start", show_alert=True)
+        return
+
+    db = get_db()
+    if not db:
+        bot.answer_callback_query(call.id, "❌ Помилка БД", show_alert=True)
+        return
+    try:
+        result  = db.execute("SELECT username, name FROM trainers WHERE id = ?", [tid])
+        trainer = result.rows[0] if result.rows else None
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ {str(e)[:50]}", show_alert=True)
+        return
+    if not trainer:
+        bot.answer_callback_query(call.id, "❌ Тренера не знайдено", show_alert=True)
+        return
+
+    trainer_username = str(trainer[0])
+    trainer_name     = str(trainer[1])
+
+    # Сохраняем данные тренера в сессию — нужны при подтверждении
+    data["trainer_id"]       = tid
+    data["trainer_name"]     = trainer_name
+    data["trainer_username"] = trainer_username
+
+    bot.answer_callback_query(call.id, "📨 Заявку надіслано!")
+
+    # --- Сообщение ученику ---
+    bot.edit_message_text(
+        f"✅ Ви записались до тренера *{trainer_name}*\\!\n\n"
+        f"⏳ Очікуйте підтвердження адміністратора\\.\n"
+        f"Як тільки адмін підтвердить — ви отримаєте повідомлення\\.",
+        cid, call.message.message_id,
+        parse_mode="MarkdownV2"
+    )
+    send_main_menu(cid, call.from_user.id, "Ми повідомимо вас!")
+
+    # --- Сообщение тренеру (предварительное — без подтверждения) ---
+    trainer_msg = (
+        f"📬 *Новий запит на заняття\\!*\n\n"
+        f"👤 Учень: *{data['name']}*\n"
+        f"📱 Телефон: `{data['phone']}`\n"
+        f"♟️ Рівень: {data['level']}\n\n"
+        f"_Очікуйте підтвердження від адміністратора\\._"
+    )
+    try:
+        bot.send_message(f"@{trainer_username}", trainer_msg, parse_mode="MarkdownV2")
+        logger.info(f"📨 Попередження тренеру @{trainer_username} надіслано")
+    except Exception as e:
+        logger.warning(f"⚠️ Не вдалося надіслати тренеру @{trainer_username}: {e}")
+
+    # --- Сообщение АДМИНИСТРАТОРУ с кнопкой подтверждения ---
+    user_tg = f"@{call.from_user.username}" if call.from_user.username else f"ID {cid}"
+    admin_msg = (
+        f"📋 *Новий запис до тренера\\!*\n\n"
+        f"👤 Учень: *{data['name']}* \\({user_tg}\\)\n"
+        f"📱 Телефон: `{data['phone']}`\n"
+        f"♟️ Рівень: {data['level']}\n"
+        f"👨‍🏫 Тренер: *{trainer_name}* \\(@{trainer_username}\\)\n\n"
+        f"Підтвердіть або відхиліть запис:"
+    )
+    confirm_markup = types.InlineKeyboardMarkup()
+    confirm_markup.row(
+        types.InlineKeyboardButton(
+            "✅ Підтвердити",
+            callback_data=f"confirm_enroll_{cid}_{tid}"
+        ),
+        types.InlineKeyboardButton(
+            "❌ Відхилити",
+            callback_data=f"reject_enroll_{cid}_{tid}"
+        )
+    )
+    try:
+        bot.send_message(ADMIN_ID, admin_msg, parse_mode="MarkdownV2", reply_markup=confirm_markup)
+    except Exception as e:
+        logger.error(f"❌ Не вдалося надіслати адміну: {e}")
+
+
+# ==========================================================
+# ✅ / ❌  АДМІН ПІДТВЕРДЖУЄ / ВІДХИЛЯЄ ЗАПИС
+# ==========================================================
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("confirm_enroll_"))
+def admin_confirm_enroll(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Тільки для адміна", show_alert=True)
+        return
+
+    # callback: confirm_enroll_{user_cid}_{trainer_id}
+    parts = call.data.split("_")
+    # ["confirm","enroll","cid","tid"]
+    try:
+        user_cid = int(parts[2])
+        tid      = int(parts[3])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "❌ Некоректні дані", show_alert=True)
+        return
+
+    data = user_form.get(user_cid)
+
+    bot.answer_callback_query(call.id, "✅ Запис підтверджено!")
+    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    bot.edit_message_text(
+        call.message.text + "\n\n✅ *Підтверджено адміністратором\\.*",
+        call.message.chat.id, call.message.message_id,
+        parse_mode="MarkdownV2"
+    )
+
+    trainer_name     = data["trainer_name"]     if data else "тренера"
+    trainer_username = data["trainer_username"] if data else None
+    user_name        = data["name"]             if data else "учня"
+    user_phone       = data["phone"]            if data else "—"
+    user_level       = data["level"]            if data else "—"
+
+    # --- Сообщение ученику ---
+    try:
+        bot.send_message(
+            user_cid,
+            f"🎉 *Запис підтверджено\\!*\n\n"
+            f"Адміністратор підтвердив ваш запис до тренера *{trainer_name}*\\.\n"
+            f"Тренер зв'яжеться з вами найближчим часом\\!",
+            parse_mode="MarkdownV2"
+        )
+    except Exception as e:
+        logger.warning(f"Не вдалося надіслати учню {user_cid}: {e}")
+
+    # --- Сообщение тренеру ---
+    if trainer_username:
+        try:
+            bot.send_message(
+                f"@{trainer_username}",
+                f"✅ *Адмін підтвердив запис\\!*\n\n"
+                f"До вас записався новий учень:\n"
+                f"👤 *{user_name}*\n"
+                f"📱 `{user_phone}`\n"
+                f"♟️ Рівень: {user_level}\n\n"
+                f"Зв'яжіться з учнем для організації занять\\!",
+                parse_mode="MarkdownV2"
+            )
+        except Exception as e:
+            logger.warning(f"Не вдалося надіслати тренеру @{trainer_username}: {e}")
+
+    # Очищаем сессию
+    user_form.pop(user_cid, None)
+    user_states.pop(user_cid, None)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("reject_enroll_"))
+def admin_reject_enroll(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Тільки для адміна", show_alert=True)
+        return
+
+    parts = call.data.split("_")
+    # ["reject","enroll","cid","tid"]
+    try:
+        user_cid = int(parts[2])
+        tid      = int(parts[3])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "❌ Некоректні дані", show_alert=True)
+        return
+
+    data = user_form.get(user_cid)
+    trainer_name = data["trainer_name"] if data else "тренера"
+
+    bot.answer_callback_query(call.id, "❌ Запис відхилено.")
+    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    bot.edit_message_text(
+        call.message.text + "\n\n❌ *Відхилено адміністратором\\.*",
+        call.message.chat.id, call.message.message_id,
+        parse_mode="MarkdownV2"
+    )
+
+    # --- Сообщение ученику ---
+    try:
+        bot.send_message(
+            user_cid,
+            f"😔 *На жаль, запис відхилено\\.*\n\n"
+            f"Адміністратор не зміг підтвердити ваш запис до тренера *{trainer_name}*\\.\n"
+            f"Спробуйте обрати іншого тренера або зверніться до адміністратора\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=main_menu_markup(user_cid)
+        )
+    except Exception as e:
+        logger.warning(f"Не вдалося надіслати учню {user_cid}: {e}")
+
+    user_form.pop(user_cid, None)
+    user_states.pop(user_cid, None)
+
+
+# ==========================================================
+# 💬  ЧАТ З АДМІНІСТРАТОРОМ
+# ==========================================================
+
+@bot.message_handler(func=lambda m: m.text == "💬 Зв'язатися з адміністратором")
+def contact_admin_start(message):
+    user_states[message.chat.id] = "waiting_admin_response"
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(BTN_CANCEL)
+    bot.send_message(
+        message.chat.id,
+        "⏳ Запит надіслано адміністратору\\. Очікуйте…\n"
+        "Натисніть *❌ Скасувати*, щоб повернутись до меню\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=markup
+    )
+
+    user_info    = f"@{message.from_user.username}" if message.from_user.username else f"ID {message.chat.id}"
+    admin_markup = types.InlineKeyboardMarkup()
+    admin_markup.add(
+        types.InlineKeyboardButton("✅ Прийняти",  callback_data=f"chat_accept_{message.chat.id}"),
+        types.InlineKeyboardButton("❌ Відхилити", callback_data=f"chat_reject_{message.chat.id}")
+    )
+    bot.send_message(
+        ADMIN_ID,
+        f"📞 Запит на чат від {user_info}\nІм'я: {message.from_user.first_name}",
+        reply_markup=admin_markup
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("chat_accept_"))
+def chat_accept(call):
+    uid = int(call.data.split("_")[2])
+    if uid in admin_chats:
+        bot.answer_callback_query(call.id, "⚠️ Цей чат вже активний", show_alert=True)
+        return
+    admin_chats[uid] = call.from_user.id
+    user_states[uid] = "in_admin_chat"
+    bot.edit_message_text("✅ Чат прийнято.", call.message.chat.id, call.message.message_id)
+
+    admin_kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    admin_kb.add(BTN_CANCEL)
+    bot.send_message(
+        call.from_user.id,
+        f"💬 Чат з користувачем {uid} розпочато\\.\n"
+        f"Натисніть *❌ Скасувати*, щоб завершити\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=admin_kb
+    )
+
+    user_kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    user_kb.add(BTN_CANCEL)
+    bot.send_message(
+        uid,
+        "✅ Адміністратор прийняв запит\\. Пишіть\\!\n"
+        "Натисніть *❌ Скасувати*, щоб завершити чат\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=user_kb
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("chat_reject_"))
+def chat_reject(call):
+    uid = int(call.data.split("_")[2])
+    bot.edit_message_text("❌ Відхилено.", call.message.chat.id, call.message.message_id)
+    user_states.pop(uid, None)
+    bot.send_message(
+        uid,
+        "😔 Адміністратор зараз недоступний\\. Спробуйте пізніше\\.",
+        parse_mode="MarkdownV2",
+        reply_markup=main_menu_markup(uid)
+    )
+
+
+@bot.message_handler(
+    func=lambda m: user_states.get(m.chat.id) == "in_admin_chat"
+                   and m.chat.id in admin_chats
+)
+def relay_user_to_admin(message):
+    admin_id = admin_chats.get(message.chat.id)
+    if admin_id:
+        try:
+            bot.send_message(admin_id, f"👤 Користувач: {message.text}")
+        except Exception as e:
+            logger.warning(f"relay_user→admin: {e}")
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id == ADMIN_ID
+                   and any(a == ADMIN_ID for a in admin_chats.values())
+                   and m.text not in ADMIN_RESERVED
+)
+def relay_admin_to_user(message):
+    user_id = next((u for u, a in admin_chats.items() if a == message.from_user.id), None)
+    if not user_id:
+        bot.send_message(message.chat.id, "ℹ️ Активних чатів немає.")
+        return
+    try:
+        bot.send_message(user_id, f"👨‍💼 Адмін: {message.text}")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Не вдалося надіслати: {e}")
+
+
+# ==========================================================
+# 🌐  FLASK ENDPOINTS
+# ==========================================================
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    logger.info("[WEBHOOK] POST запит отримано")
-
     try:
-        update = request.get_json(force=True)
-        logger.info("[WEBHOOK] Update отримано")
-
-        # message handling
-        msg = update.get("message")
-        if not msg:
-            logger.warning("[WEBHOOK] Немає message")
-            return "ok", 200
-
-        chat = msg.get("chat", {}) or {}
-        chat_id = chat.get("id")
-        from_user = msg.get("from", {}) or {}
-        user_id = from_user.get("id")
-        text = msg.get("text", "") or ""
-
-        if not user_id:
-            logger.warning("[WEBHOOK] Немає user_id")
-            return "ok", 200
-
-        # Rate limiting
-        if not rate_limit_check(user_id):
-            send_message(chat_id, ERROR_RATE_LIMIT, parse_mode="HTML")
-            return "ok", 200
-
-        logger.info(f"[WEBHOOK] chat_id={chat_id}, user_id={user_id}, text='{text}'")
-
-        # Пошук команди
-        command = None
-        for possible in ("/start", "/stats"):
-            if text.startswith(possible):
-                command = possible
-                logger.info(f"[WEBHOOK] Команда: {command}")
-                break
-
-        if command:
-            threading.Thread(target=handle_command, args=(command, chat_id, user_id), daemon=True).start()
-            return "ok", 200
-
-        # Обработка +число
-        if text.startswith("+"):
-            threading.Thread(target=handle_plus_command, args=(chat_id, user_id, text), daemon=True).start()
-            return "ok", 200
-
-        return "ok", 200
-    
+        update = telebot.types.Update.de_json(request.get_json())
+        bot.process_new_updates([update])
     except Exception as e:
-        logger.error(f"[WEBHOOK ERROR] {e}", exc_info=True)
-        return "error", 500
+        logger.error(f"webhook: {e}")
+    return "", 200
+
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True}), 200
+    db = get_db()
+    return ("OK", 200) if db else ("ERROR", 500)
 
-@app.route("/", methods=["GET"])
-def index():
-    hist_stats = get_history_stats()
-    stats = {
-        "status": "🟢 Бот запущен",
-        "total_messages": message_count,
-        "global_sequence": global_sequence,
-        "successful_batches": hist_stats["successful_batches"],
-        "timestamp": datetime.now().isoformat()
-    }
-    return jsonify(stats), 200
 
-@app.route("/api/stats", methods=["GET"])
-def api_stats():
-    """API endpoint для отримання детальної статистики"""
-    hist_stats = get_history_stats()
-    return jsonify({
-        "total_count": message_count,
-        "global_sequence": global_sequence,
-        "successful_batches": hist_stats["successful_batches"],
-        "total_batches": hist_stats["total_batches"],
-        "total_from_history": hist_stats["total_from_history"],
-        "is_sending": sending_in_progress,
-        "timestamp": datetime.now().isoformat()
-    }), 200
+@app.route("/debug", methods=["GET"])
+def debug_db():
+    try:
+        payload = {"requests": [
+            {"type": "execute", "stmt": {"sql": "SELECT id, name, username, description FROM trainers"}},
+            {"type": "close"}
+        ]}
+        raw  = requests.post(
+            f"{TURSO_URL}/v2/pipeline", json=payload,
+            headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"},
+            timeout=10
+        )
+        db   = get_db()
+        rows = []
+        if db:
+            try:
+                rows = [list(r) for r in db.execute(
+                    "SELECT id, name, username, description FROM trainers"
+                ).rows]
+            except Exception as e:
+                rows = [f"ERROR: {e}"]
+        return (
+            json.dumps(
+                {"http_status": raw.status_code,
+                 "raw_turso_response": raw.json(),
+                 "parsed_rows": rows},
+                ensure_ascii=False, indent=2
+            ),
+            200,
+            {"Content-Type": "application/json"}
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False), 500
 
-@app.route("/api/history", methods=["GET"])
-def api_history():
-    """API endpoint для отримання історії повідомлень"""
-    return jsonify({"history": message_history}), 200
+
+# ==========================================================
+# 🚀  ЗАПУСК
+# ==========================================================
 
 if __name__ == "__main__":
+    logger.info("🚀 Запуск бота…")
+    if not init_db():
+        logger.error("❌ Не вдалося ініціалізувати БД")
     try:
-        logger.info("=" * 60)
-        logger.info("ЗАПУСК ТЕЛЕГРАМ БОТА З МОДЕРНІЗОВАНОЮ СИСТЕМОЮ")
-        logger.info("=" * 60)
-        logger.info(f"Загальний лічильник: {message_count}")
-        logger.info(f"Глобальна послідовність: {global_sequence}")
-        logger.info(f"Записів у історії: {len(message_history)}")
-        logger.info("=" * 60)
-        
-        # Удаляем старый webhook перед регистрацией нового
-        logger.info("Удаление старого webhook...")
-        delete_webhook()
-        time.sleep(1)
-        
-        # Запускаем idle режим
-        start_idle_mode()
-        
-        # Регистрируем новый webhook
-        logger.info("Регистрация нового webhook...")
-        register_webhook()
-        
-        # Запускаем Flask приложение
-        logger.info(f"Запуск бота на 0.0.0.0:{PORT}")
-        app.run("0.0.0.0", port=PORT, threaded=True, debug=False)
+        bot.remove_webhook()
+    except Exception:
+        pass
+    try:
+        bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+        logger.info(f"✅ Webhook встановлено: {WEBHOOK_URL}/webhook")
     except Exception as e:
-        logger.error(f"Error running app: {e}")
-    finally:
-        stop_idle_mode()
-        delete_webhook()
+        logger.error(f"❌ set_webhook: {e}")
+    port = int(os.getenv("PORT", 5000))
+    logger.info(f"🌐 Порт {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
+
